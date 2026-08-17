@@ -1,0 +1,152 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+Vagrant.configure("2") do |config|
+
+  # Base Box
+  config.vm.box = "ubuntu/jammy64"
+  config.vm.box_check_update = false
+  config.vm.hostname = "sonarqube"
+
+  # Network
+  config.vm.network "forwarded_port", guest: 9000, host: 9000, host_ip: "127.0.0.1"
+  config.vm.network "forwarded_port", guest: 80, host: 8090, host_ip: "127.0.0.1"
+  config.vm.network "private_network", ip: "192.168.56.11"
+
+  # Shared Folder
+  config.vm.synced_folder ".", "/vagrant"
+
+  # VirtualBox Provider
+  config.vm.provider "virtualbox" do |vb|
+    vb.name   = "sonarqube-vm"
+    vb.memory = "6144"
+    vb.cpus   = 2
+    vb.gui    = false
+
+    vb.customize ["modifyvm", :id, "--natdnshostresolver1", "on"]
+    vb.customize ["modifyvm", :id, "--natdnsproxy1",        "on"]
+  end
+
+  # Provisioning
+  config.vm.provision "shell", inline: <<-SHELL
+    set -euxo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+
+    echo "Step 1: Kernel and limits tuning"
+    cp /etc/sysctl.conf /root/sysctl.conf_backup
+    cat <<EOT> /etc/sysctl.conf
+vm.max_map_count=262144
+fs.file-max=65536
+EOT
+    sysctl -p
+
+    cp /etc/security/limits.conf /root/sec_limit.conf_backup
+    cat <<EOT> /etc/security/limits.conf
+sonarqube - nofile 65536
+sonarqube - nproc 4096
+EOT
+
+    echo "Step 2: Java 21"
+    apt-get update -y
+    apt-get install -y openjdk-21-jdk
+    update-alternatives --config java || true
+    java -version
+
+    echo "Step 3: PostgreSQL"
+    wget -q https://www.postgresql.org/media/keys/ACCC4CF8.asc -O - | apt-key add -
+    sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt/ `lsb_release -cs`-pgdg main" >> /etc/apt/sources.list.d/pgdg.list'
+    apt update -y
+    apt install -y postgresql postgresql-contrib
+    systemctl enable --now postgresql.service
+
+    echo "postgres:admin123" | chpasswd
+    runuser -l postgres -c "createuser sonar"
+    sudo -i -u postgres psql -c "ALTER USER sonar WITH ENCRYPTED PASSWORD 'admin123';"
+    sudo -i -u postgres psql -c "CREATE DATABASE sonarqube OWNER sonar;"
+    sudo -i -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE sonarqube to sonar;"
+    sudo -i -u postgres psql -d sonarqube -c "GRANT ALL ON SCHEMA public TO sonar;"
+    systemctl restart postgresql
+
+    echo "Step 4: SonarQube 26.4.0.121862"
+    mkdir -p /sonarqube/
+    cd /sonarqube/
+    curl -O https://binaries.sonarsource.com/Distribution/sonarqube/sonarqube-26.4.0.121862.zip
+    apt-get install -y zip
+    unzip -o sonarqube-26.4.0.121862.zip -d /opt/
+    mv /opt/sonarqube-26.4.0.121862 /opt/sonarqube
+    groupadd sonar
+    useradd -c "SonarQube - User" -d /opt/sonarqube/ -g sonar sonar
+    chown sonar:sonar /opt/sonarqube/ -R
+    chmod 1777 /tmp
+
+    echo "Step 5: sonar.properties"
+    cp /opt/sonarqube/conf/sonar.properties /root/sonar.properties_backup
+    cat <<EOT> /opt/sonarqube/conf/sonar.properties
+sonar.jdbc.username=sonar
+sonar.jdbc.password=admin123
+sonar.jdbc.url=jdbc:postgresql://localhost/sonarqube
+sonar.web.host=0.0.0.0
+sonar.web.port=9000
+sonar.web.javaAdditionalOpts=-server -Xmx1024m
+sonar.search.javaOpts=-Xmx512m -Xms512m
+sonar.log.level=INFO
+sonar.path.logs=logs
+EOT
+
+    echo "Step 6: systemd service"
+    cat <<EOT> /etc/systemd/system/sonarqube.service
+[Unit]
+Description=SonarQube service
+After=syslog.target network.target
+
+[Service]
+Type=forking
+ExecStart=/opt/sonarqube/bin/linux-x86-64/sonar.sh start
+ExecStop=/opt/sonarqube/bin/linux-x86-64/sonar.sh stop
+User=sonar
+Group=sonar
+Restart=always
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target
+EOT
+    systemctl daemon-reload
+    systemctl enable sonarqube.service
+
+    echo "Step 7: Nginx reverse proxy"
+    apt-get install -y nginx
+    rm -rf /etc/nginx/sites-enabled/default
+    rm -rf /etc/nginx/sites-available/default
+    cat <<EOT> /etc/nginx/sites-available/sonarqube
+server{
+    listen 80;
+    server_name _;
+    access_log /var/log/nginx/sonar.access.log;
+    error_log /var/log/nginx/sonar.error.log;
+    proxy_buffers 16 64k;
+    proxy_buffer_size 128k;
+    location / {
+        proxy_pass http://127.0.0.1:9000;
+        proxy_next_upstream error timeout invalid_header http_500 http_502 http_503 http_504;
+        proxy_redirect off;
+
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto http;
+    }
+}
+EOT
+    ln -s /etc/nginx/sites-available/sonarqube /etc/nginx/sites-enabled/sonarqube
+    systemctl enable nginx.service
+    ufw allow 80,9000/tcp || true
+
+    echo "PROVISIONING COMPLETE! Rebooting in 15 seconds..."
+    sleep 15
+    reboot
+
+  SHELL
+
+end

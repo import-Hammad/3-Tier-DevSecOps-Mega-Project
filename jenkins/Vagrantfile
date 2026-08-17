@@ -1,0 +1,149 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+Vagrant.configure("2") do |config|
+
+  # ─── Base Box ────────────────────────────────────────────────────────────────
+  config.vm.box = "ubuntu/jammy64"   # Ubuntu 22.04 LTS (arm users: use bento/ubuntu-22.04)
+  config.vm.box_check_update = false
+
+  # ─── Network ─────────────────────────────────────────────────────────────────
+  # Access Jenkins at http://localhost:8080 from your Windows host
+  config.vm.network "forwarded_port", guest: 8080, host: 8080, host_ip: "127.0.0.1"
+  config.vm.network "private_network", ip: "192.168.56.10"
+
+  # ─── Shared Folder ───────────────────────────────────────────────────────────
+  config.vm.synced_folder ".", "/vagrant"
+
+  # ─── VirtualBox Provider ─────────────────────────────────────────────────────
+  config.vm.provider "virtualbox" do |vb|
+    vb.name   = "jenkins-terraform-vm"
+    vb.memory = "4096"   # 4 GB RAM (Jenkins needs at least 2 GB)
+    vb.cpus   = 2
+    vb.gui    = false
+
+    # Improves DNS resolution speed inside the VM
+    vb.customize ["modifyvm", :id, "--natdnshostresolver1", "on"]
+    vb.customize ["modifyvm", :id, "--natdnsproxy1",        "on"]
+  end
+
+  # ─── Provisioning ────────────────────────────────────────────────────────────
+  config.vm.provision "shell", inline: <<-SHELL
+
+    set -euxo pipefail
+    export DEBIAN_FRONTEND=noninteractive   # prevents apt from popping an interactive prompt and hanging vagrant up
+
+    echo "============================================="
+    echo "  Step 1: System Update"
+    echo "============================================="
+    apt-get update -y
+    apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+    apt-get install -y \
+      curl wget git unzip gnupg software-properties-common \
+      apt-transport-https ca-certificates lsb-release
+
+
+    echo "============================================="
+    echo "  Step 2: Install Java 17 (Jenkins dependency)"
+    echo "============================================="
+    apt-get install -y openjdk-17-jdk
+    java -version
+
+
+    echo "============================================="
+    echo "  Step 3: Install Jenkins (LTS)"
+    echo "============================================="
+    # NOTE: Jenkins rotated its Debian/Ubuntu repo signing key.
+    # The old jenkins.io-2023.key will fail GPG verification on current LTS releases.
+    curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2026.key \
+      | tee /usr/share/keyrings/jenkins-keyring.asc > /dev/null
+
+    echo "deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] \
+      https://pkg.jenkins.io/debian-stable binary/" \
+      | tee /etc/apt/sources.list.d/jenkins.list > /dev/null
+
+    apt-get update -y
+    apt-get install -y jenkins
+
+    systemctl enable jenkins
+    systemctl start jenkins
+
+    echo ""
+    echo ">>> Jenkins installed. Initial admin password:"
+    cat /var/lib/jenkins/secrets/initialAdminPassword || echo "(not yet generated — wait 30 sec)"
+
+
+    echo "============================================="
+    echo "  Step 4: Install Docker (for Jenkins agents)"
+    echo "============================================="
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+      | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] \
+      https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+      | tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+    apt-get update -y
+    apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+    systemctl enable docker
+    systemctl start docker
+
+    # Allow jenkins user to run Docker without sudo
+    usermod -aG docker jenkins
+    usermod -aG docker vagrant
+
+
+    echo "============================================="
+    echo "  Step 5: Install Terraform"
+    echo "============================================="
+    TERRAFORM_VERSION="1.9.5"
+
+    wget -q "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" \
+      -O /tmp/terraform.zip
+
+    unzip -o /tmp/terraform.zip -d /usr/local/bin/
+    chmod +x /usr/local/bin/terraform
+    rm /tmp/terraform.zip
+
+    terraform version
+
+
+    echo "============================================="
+    echo "  Step 6: Install AWS CLI v2"
+    echo "============================================="
+    curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+    unzip -o /tmp/awscliv2.zip -d /tmp/
+    /tmp/aws/install --update
+    rm -rf /tmp/aws /tmp/awscliv2.zip
+
+    aws --version
+
+
+    echo "============================================="
+    echo "  Step 7: Restart Jenkins (picks up Docker group)"
+    echo "============================================="
+    systemctl restart jenkins
+
+
+    echo "============================================="
+    echo "  Step 8: Waiting for Jenkins to finish initializing"
+    echo "============================================="
+    for i in $(seq 1 30); do
+      if [ -f /var/lib/jenkins/secrets/initialAdminPassword ]; then
+        break
+      fi
+      sleep 2
+    done
+
+    echo ""
+    echo "================================================="
+    echo "  PROVISIONING COMPLETE!"
+    echo "  Jenkins  → http://localhost:8080"
+    echo "  Initial admin password:"
+    cat /var/lib/jenkins/secrets/initialAdminPassword || echo "  Not generated yet — run: vagrant ssh -c 'sudo cat /var/lib/jenkins/secrets/initialAdminPassword'"
+    echo "================================================="
+
+  SHELL
+
+end
